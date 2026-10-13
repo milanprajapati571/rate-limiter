@@ -1,0 +1,23 @@
+# Build directories
+build/
+bin/
+obj/
+*.exe
+*.obj
+*.pdb
+*.ilk
+
+# Node
+node_modules/
+package-lock.json
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE / OS
+.vs/
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
