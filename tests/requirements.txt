@@ -1,0 +1,4 @@
+# The benchmark script is engineered to run zero-dependency on Python 3.8+ using standard library!
+# Optional packages for development or expanded benchmarking:
+requests>=2.31.0
+urllib3>=2.0.0
