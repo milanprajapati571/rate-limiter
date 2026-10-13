@@ -1,0 +1,14 @@
+{
+  "name": "node-rate-limiter",
+  "version": "1.0.0",
+  "description": "High-performance distributed rate limiter demonstration in Node.js",
+  "main": "src/server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ioredis": "^5.4.1"
+  }
+}
