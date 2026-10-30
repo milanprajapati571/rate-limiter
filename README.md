@@ -1,33 +1,17 @@
 # Distributed Multi-Stack Rate Limiter
 
-A production-grade, dual-stack rate-limiting system engineered in **C++ (C++17/cpp-httplib)** and **Node.js (Express)** to demonstrate, benchmark, and compare five foundational rate-limiting algorithms. The system supports distributed state management via **Redis** (with atomic Lua scripts) alongside a seamless, thread-safe **in-memory fallback** when Redis is unavailable. A concurrent **Python benchmark suite** provides automated functional validation and high-throughput latency profiling.
+[![Standard](https://img.shields.io/badge/C%2B%2B-17-blue.svg?logo=c%2B%2B)](https://en.cppreference.com/w/cpp/17)
+[![Node.js](https://img.shields.io/badge/Node.js-v18%2B%20%7C%20v22-green.svg?logo=node.js)](https://nodejs.org/)
+[![Redis](https://img.shields.io/badge/Redis-Atomic%20Lua-red.svg?logo=redis)](https://redis.io/)
+[![Python](https://img.shields.io/badge/Python-3.8%2B%20Zero--Dep-yellow.svg?logo=python)](https://python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey.svg)]()
+
+> A high-performance, production-grade distributed rate-limiting engine engineered in parallel across two native stacks: **modern C++ (C++17/cpp-httplib)** and **Node.js (Express/ioredis)**. Designed to demonstrate, benchmark, and compare five foundational rate-limiting algorithms with atomic distributed state management via **Redis Lua scripts**, resilient zero-downtime **in-memory fallbacks**, and an automated multi-threaded **Python benchmarking suite**.
 
 ---
 
-## Table of Contents
-1. [Architecture Overview](#architecture-overview)
-2. [Rate Limiting Concepts & Algorithm Deep Dive](#rate-limiting-concepts--algorithm-deep-dive)
-   - [1. Fixed Window Counter](#1-fixed-window-counter)
-   - [2. Sliding Window Log](#2-sliding-window-log)
-   - [3. Sliding Window Counter](#3-sliding-window-counter)
-   - [4. Token Bucket](#4-token-bucket)
-   - [5. Leaky Bucket](#5-leaky-bucket)
-   - [Algorithm Comparison Matrix](#algorithm-comparison-matrix)
-3. [Distributed State Management & Redis Lua Scripts](#distributed-state-management--redis-lua-scripts)
-4. [Project Structure](#project-structure)
-5. [Setup & Execution Guide](#setup--execution-guide)
-   - [Prerequisites](#prerequisites)
-   - [Redis Setup](#redis-setup)
-   - [Building & Running the C++ Server](#building--running-the-c-server)
-   - [Running the Node.js Server](#running-the-nodejs-server)
-   - [Running the Python Validation & Benchmark Suite](#running-the-python-validation--benchmark-suite)
-6. [API Specification](#api-specification)
-7. [Benchmark Performance Results](#benchmark-performance-results)
-8. [Future Work: Role-Based Rate Limiting (RBAC) Architecture](#future-work-role-based-rate-limiting-rbac-architecture)
-
----
-
-## Architecture Overview
+## 🏛️ Architecture Overview
 
 ```
                                   +------------------------------------------+
@@ -41,6 +25,7 @@ A production-grade, dual-stack rate-limiting system engineered in **C++ (C++17/c
                  +-----------------------+                           +-----------------------+
                  |   cpp_rate_limiter    |                           |   node_rate_limiter   |
                  |  (cpp-httplib/CMake)  |                           |     (Express.js)      |
+                 | ThreadPool (128 wrks) |                           |  Single-Thread Event  |
                  |      Port: 8080       |                           |      Port: 3000       |
                  +-----------+-----------+                           +-----------+-----------+
                              |                                                   |
@@ -49,292 +34,98 @@ A production-grade, dual-stack rate-limiting system engineered in **C++ (C++17/c
                                                        v
                                    +---------------------------------------+
                                    |         Redis State Store             |
-                                   |       (localhost:6379 / RESP)         |
-                                   |    * Automatic In-Memory Fallback *   |
+                                   |    (Atomic Lua Scripts + Key TTL)     |
+                                   +-------------------+-------------------+
+                                                       |
+                                          [If Redis Disconnected]
+                                                       v
+                                   +---------------------------------------+
+                                   |     Local In-Memory Fallback          |
+                                   |   (C++ std::mutex / Node Map Store)   |
                                    +---------------------------------------+
 ```
 
-Both server implementations expose identical REST contracts and rate-limiting headers:
+Both server implementations expose identical REST contracts and standardized RFC rate-limiting headers:
 * `X-RateLimit-Limit`: Maximum requests permitted in the current period/bucket.
-* `X-RateLimit-Remaining`: Remaining request quota.
+* `X-RateLimit-Remaining`: Remaining request quota for the calling client.
 * `X-RateLimit-Reset`: Unix timestamp (seconds) when quota refreshes.
 * `Retry-After`: (Returned on `429 Too Many Requests`) Seconds the client must pause before retrying.
 
 ---
 
-## Rate Limiting Concepts & Algorithm Deep Dive
+## ⚡ Core Systems Engineering Features
 
-Rate limiting protects APIs from denial-of-service (DoS) attacks, brute-force attacks, web scrapers, and cascading system overloads. Five core algorithms are implemented across both stacks:
-
-### 1. Fixed Window Counter
-* **Concept:** Time is partitioned into discrete, non-overlapping windows of length $T$ (e.g., 10 seconds). A single counter tracks requests within window $W_i = \lfloor \text{now} / T \rfloor$.
-* **Boundary Flaw:** While $O(1)$ memory, it is vulnerable to **traffic bursts at window boundaries**. A client could send $M$ requests at the tail of window $W_0$ and $M$ requests at the start of window $W_1$, resulting in $2M$ requests served in a window of size $T$.
-* **Time Complexity:** $O(1)$
-* **Space Complexity:** $O(1)$ per client
-
-### 2. Sliding Window Log
-* **Concept:** Instead of a counter, every request timestamp is retained in a sorted collection (Redis `ZSET` or in-memory deque). When a new request arrives at $t_{\text{now}}$, entries older than $t_{\text{now}} - T$ are purged. If the remaining count is less than $M$, the request is logged and admitted.
-* **Characteristics:** Extremely accurate; completely eliminates boundary burst anomalies. However, it incurs significant memory overhead under high request volume because every request adds an entry.
-* **Time Complexity:** $O(\log N)$ for insertion/purging
-* **Space Complexity:** $O(N)$ where $N$ is the request count per window
-
-### 3. Sliding Window Counter
-* **Concept:** A hybrid approach blending Fixed Window efficiency with Sliding Window accuracy. It calculates an estimated request count by taking a weighted sum of the previous and current window counters:
-  $$\text{Estimated Count} = \text{Count}_{\text{prev}} \times \left(1 - \frac{t_{\text{elapsed}}}{T}\right) + \text{Count}_{\text{curr}}$$
-* **Characteristics:** Approximates sliding window behavior without storing individual timestamps, operating in constant space.
-* **Time Complexity:** $O(1)$
-* **Space Complexity:** $O(1)$
-
-### 4. Token Bucket
-* **Concept:** A bucket holds up to capacity $C$ tokens. Tokens regenerate continuously at a fixed refill rate $r$ (tokens/sec):
-  $$\text{tokens} = \min\left(C, \text{tokens}_{\text{prev}} + \Delta t \times r\right)$$
-  Each incoming request consumes 1 token. If sufficient tokens exist, the request is permitted; otherwise, it is rejected.
-* **Characteristics:** **Permits bursty traffic** up to capacity $C$, while guaranteeing that long-term throughput never exceeds $r$. Extensively used by AWS and Cloudflare.
-* **Time Complexity:** $O(1)$
-* **Space Complexity:** $O(1)$
-
-### 5. Leaky Bucket
-* **Concept:** Requests enter a buffer (bucket) of capacity $B$ and drain (are processed) at a constant, steady leak rate $r$. If the bucket overflows (incoming rate exceeds leak rate + buffer capacity), new requests are dropped.
-* **Characteristics:** **Smooths out traffic spikes** into a strictly uniform output stream. Essential for downstream services that cannot tolerate sudden spikes.
-* **Time Complexity:** $O(1)$
-* **Space Complexity:** $O(1)$
+| CS Domain | Feature Implemented | Technical Mechanism |
+| :--- | :--- | :--- |
+| **Distributed Systems** | Atomic Distributed State Management | Single-RTT Redis Lua scripts preventing Check-Then-Act race conditions |
+| **System Design** | Multi-Algorithm Rate Governance | 5 algorithms comparing burst tolerance, smoothing, and boundary anomalies |
+| **Operating Systems** | High-Concurrency Threading | Pre-allocated C++ worker thread pool with `std::mutex` vs Node.js Event Loop |
+| **Computer Networks** | Wire Protocol & Header Governance | Native Winsock RESP protocol client & RFC draft standard rate-limiting headers |
+| **Resilience Engineering** | Zero-Downtime Fallback | Automatic transition to thread-safe local memory store if Redis disconnects |
 
 ---
 
-### Algorithm Comparison Matrix
+## 🔬 Core Algorithms Implemented
 
-| Algorithm | Burst Handling | Memory Overhead | Precision | CPU Cost | Ideal Use Case |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Fixed Window Counter** | Poor (2x burst at boundaries) | $O(1)$ (Very Low) | Low | Very Low | Coarse quotas (e.g., daily API limits) |
-| **Sliding Window Log** | Smooth (No boundary spikes) | $O(N)$ (High) | 100% Exact | Medium-High | High-value, low-volume APIs |
-| **Sliding Window Counter** | Very Good (Weighted smoothing) | $O(1)$ (Very Low) | ~99% Smooth | Low | High-throughput web APIs |
-| **Token Bucket** | Controlled bursts up to capacity | $O(1)$ (Very Low) | High | Very Low | User-facing endpoints, burst-tolerant APIs |
-| **Leaky Bucket** | Strictly buffers or drops bursts | $O(1)$ (Very Low) | High | Very Low | Queue smoothing, steady outbound streams |
-
----
-
-## Distributed State Management & Redis Lua Scripts
-
-In distributed microservice deployments, multiple application servers process requests concurrently for the same clients. Naive "read-then-update" checks introduce critical race conditions (the **Check-Then-Act anti-pattern**).
-
-To guarantee atomicity and sub-millisecond execution, all five algorithms are implemented using **Redis Lua Scripts**:
-1. Redis executes Lua scripts as single atomic transactions on the main thread; no competing worker can interleave writes.
-2. Network roundtrips are reduced from multiple operations (`GET`, `INCR`, `EXPIRE`) to a single roundtrip.
-3. Every script sets an explicit TTL to avoid unbounded memory accumulation for inactive clients.
-
-### Automatic In-Memory Fallback
-If Redis is down or unreachable:
-* Both C++ and Node.js automatically switch to thread-safe in-memory stores (`std::mutex` in C++, asynchronous storage in Node.js).
-* Zero crash or downtime occurs; the servers log a fallback notification and continue serving requests safely.
-* As soon as Redis becomes available, the servers reconnect automatically.
+| Milestone | Algorithm | Burst Handling | Space Complexity | Core Mechanism |
+| :---: | :--- | :--- | :---: | :--- |
+| **FR1** | **Fixed Window Counter** | Vulnerable to $2\times$ boundary spikes | $O(1)$ | Disjoint epoch window buckets with atomic Redis increment |
+| **FR2** | **Sliding Window Log** | 100% exact (No boundary spikes) | $O(N)$ | Sorted timestamp sets (Redis `ZSET`), range pruning of expired ticks |
+| **FR3** | **Sliding Window Counter** | ~99.9% smooth weighted estimate | $O(1)$ | Sliding weighted sum between previous and current window counters |
+| **FR4** | **Token Bucket** | Controlled bursts up to capacity $C$ | $O(1)$ | Lazy timestamp-based refill at rate $r$, $O(1)$ constant-time consumption |
+| **FR5** | **Leaky Bucket** | Strictly buffers or smooths traffic | $O(1)$ | Constant outflow leak rate $r$, queue buffer overflow rejection |
 
 ---
 
-## Project Structure
+## 📚 Dedicated Technical Documentation Hub
 
-```
-rate-limiter/
-│
-├── cpp_rate_limiter/                     # C++17/20 Implementation
-│   ├── CMakeLists.txt                    # Modern CMake configuration (MSVC / GCC)
-│   ├── include/
-│   │   ├── httplib.h                     # Header-only multi-threaded HTTP server
-│   │   ├── rate_limiter.hpp              # IRateLimiter interface & Result structs
-│   │   ├── algorithms.hpp                # Concrete algorithm declarations
-│   │   ├── redis_client.hpp              # Native Winsock RESP Redis client
-│   │   └── memory_storage.hpp            # Thread-safe in-memory fallback
-│   └── src/
-│       ├── main.cpp                      # Server bootstrap & HTTP route dispatch
-│       ├── storage/
-│       │   └── redis_client.cpp          # RESP protocol client implementation
-│       └── algorithms/
-│           ├── fixed_window.cpp          # Fixed Window implementation
-│           ├── sliding_window_log.cpp    # Sliding Window Log implementation
-│           ├── sliding_window_counter.cpp# Sliding Window Counter implementation
-│           ├── token_bucket.cpp          # Token Bucket implementation
-│           └── leaky_bucket.cpp          # Leaky Bucket implementation
-│
-├── node_rate_limiter/                    # Node.js Express Implementation
-│   ├── package.json                      # Dependencies (express, ioredis)
-│   └── src/
-│       ├── server.js                     # Express app & route mounting
-│       ├── storage/
-│       │   ├── redis.js                  # ioredis connection manager & Lua runner
-│       │   └── memory.js                 # In-memory storage fallback
-│       ├── middleware/
-│       │   └── rateLimiter.js            # Express rate limiter middleware & headers
-│       ├── routes/
-│       │   └── api.js                    # Route mappings for all 5 algorithms
-│       └── algorithms/
-│           ├── base.js                   # Base rate limiter class
-│           ├── fixedWindow.js            # Fixed Window implementation
-│           ├── slidingWindowLog.js       # Sliding Window Log implementation
-│           ├── slidingWindowCounter.js   # Sliding Window Counter implementation
-│           ├── tokenBucket.js            # Token Bucket implementation
-│           └── leakyBucket.js            # Leaky Bucket implementation
-│
-├── tests/
-│   ├── requirements.txt                  # Python dependencies (zero-dependency compatible)
-│   └── benchmark.py                      # Multi-threaded validation and benchmark tool
-│
-└── README.md                             # Unified system documentation
-```
+Every architectural decision, mathematical proof, concurrency pattern, and benchmark result is documented in depth:
+
+* 📖 **[01. Architecture & System Design](docs/01_architecture_and_system_design.md)** — Dual-stack topology, threading models, fail-open vs fail-closed analysis, and RBAC roadmap.
+* 📖 **[02. Rate Limiting Algorithms Deep Dive](docs/02_rate_limiting_algorithms.md)** — Mathematical proofs, boundary flaws ($2M/T$), Big-O complexities, and selection decision tree.
+* 📖 **[03. Distributed State & Redis Lua Scripts](docs/03_distributed_state_and_redis_lua.md)** — Check-then-act race conditions, atomic 1-RTT Lua scripts, and native RESP client.
+* 📖 **[04. Setup & Execution Guide](docs/04_setup_and_execution_guide.md)** — Docker Redis setup, one-click Windows scripts, CMake builds, and test commands.
+* 📖 **[05. API Specification & Contract](docs/05_api_specification_and_contract.md)** — Complete REST endpoints, client identity resolution, and 200/429 JSON payloads.
+* 📖 **[06. Benchmarks & Performance Analysis](docs/06_benchmarks_and_performance_analysis.md)** — Empirical 50-worker latency percentiles (p50/p95/p99), RPS throughput, and audit tables.
+* 📑 **[Documentation Index & Reading Guide](docs/README.md)** — Overview portal and tailored reading paths.
 
 ---
 
-## Setup & Execution Guide
+## 🚀 Quickstart & Build Instructions
 
-### Prerequisites
-* **C++ Compiler:** Visual Studio 2022 / Build Tools (MSVC) or GCC/MinGW with C++17 support.
-* **CMake:** Version 3.15 or later.
-* **Node.js:** v18 or later (Node v22 recommended).
-* **Python:** 3.8+ (for benchmark runner).
-* **Redis (Optional):** Docker or native Redis instance on `localhost:6379`.
-
----
-
-### Redis Setup (Optional)
-If Docker is installed:
+### 1. One-Click Automated Benchmark & Validation
+Execute the verification script to run functional assertion tests against all algorithms:
 ```powershell
-docker run -d --name rate-limiter-redis -p 6379:6379 redis:alpine
+.\run_benchmark.bat --validate-only
 ```
-*(If Redis is not running, both servers automatically run in In-Memory Fallback mode.)*
 
----
-
-### Building & Running the C++ Server
-
-1. Open PowerShell and navigate to the C++ project folder:
-   ```powershell
-   cd d:\FreeCodeCamp\system-project\rate-limiter\cpp_rate_limiter
-   ```
-2. Configure CMake:
-   ```powershell
-   cmake -B build -S .
-   ```
-3. Compile the executable:
-   ```powershell
-   cmake --build build --config Release
-   ```
-4. Run the server:
-   ```powershell
-   .\build\Release\cpp_rate_limiter.exe
-   ```
-* Default Port: `8080`
-* Health Check: `http://localhost:8080/health`
-
----
-
-### Running the Node.js Server
-
-1. Open PowerShell and navigate to the Node.js project folder:
-   ```powershell
-   cd d:\FreeCodeCamp\system-project\rate-limiter\node_rate_limiter
-   ```
-2. Install dependencies:
-   ```powershell
-   npm install
-   ```
-3. Start the server:
-   ```powershell
-   npm start
-   ```
-* Default Port: `3000`
-* Health Check: `http://localhost:3000/health`
-
----
-
-### Running the Python Validation & Benchmark Suite
-
-From the project root directory (`rate-limiter/`), run:
-
+To run a concurrent load benchmark (50 worker threads, 200 requests):
 ```powershell
-# 1. Run quick functional assertion checks against all algorithms
-python tests/benchmark.py --validate-only
-
-# 2. Run concurrent load benchmarking across both servers (50 workers, 200 requests)
-python tests/benchmark.py --concurrency 50 --requests 200
-
-# 3. Test a specific algorithm on C++ only
-python tests/benchmark.py --servers cpp --algorithm token-bucket
-
-# 4. Stress test with 100 workers and 500 requests
-python tests/benchmark.py --concurrency 100 --requests 500
+.\run_benchmark.bat --concurrency 50 --requests 200
 ```
+
+### 2. Building & Running the C++ Server
+Using the one-click build script:
+```powershell
+.\build_cpp.bat
+.\cpp_rate_limiter\build\Release\cpp_rate_limiter.exe
+```
+*(Default Port: `8080` | Health Check: `http://localhost:8080/health`)*
+
+### 3. Running the Node.js Server
+```powershell
+cd node_rate_limiter
+npm install
+npm start
+```
+*(Default Port: `3000` | Health Check: `http://localhost:3000/health`)*
 
 ---
 
-## API Specification
-
-All endpoints support `POST` and `GET`. Clients can pass identity via `X-Client-Id` header, query parameter `?clientId=...`, or default to client IP.
-
-| Endpoint | Method | Algorithm | Default Limit Configuration |
-| :--- | :--- | :--- | :--- |
-| `/health` | `GET` | Health Check | Returns server name, Redis connectivity, and storage mode |
-| `/api/rate-limit/fixed-window` | `POST` / `GET` | Fixed Window Counter | 10 requests / 10 seconds |
-| `/api/rate-limit/sliding-window-log` | `POST` / `GET` | Sliding Window Log | 10 requests / 10 seconds |
-| `/api/rate-limit/sliding-window-counter` | `POST` / `GET` | Sliding Window Counter | 10 requests / 10 seconds |
-| `/api/rate-limit/token-bucket` | `POST` / `GET` | Token Bucket | Capacity: 10, Refill: 2.0 tokens/sec |
-| `/api/rate-limit/leaky-bucket` | `POST` / `GET` | Leaky Bucket | Capacity: 10, Leak: 2.0 units/sec |
-
-### Sample Success Response (`200 OK`)
-```json
-{
-  "status": "success",
-  "code": 200,
-  "message": "Request successfully processed under 'TokenBucket' rate limiter.",
-  "algorithm": "TokenBucket",
-  "rateLimit": {
-    "allowed": true,
-    "limit": 10,
-    "remaining": 8,
-    "reset": 1791895200,
-    "retryAfter": 0
-  },
-  "server": "C++ httplib"
-}
-```
-
-### Sample Rate-Limited Response (`429 Too Many Requests`)
-```json
-{
-  "status": "error",
-  "code": 429,
-  "message": "Too Many Requests: Rate limit exceeded for algorithm 'TokenBucket'",
-  "algorithm": "TokenBucket",
-  "retryAfter": 1,
-  "reset": 1791895201,
-  "server": "C++ httplib"
-}
-```
-
----
-
-## Benchmark Performance Results
+## 📊 Benchmark Performance Highlights
 
 Conducted with 50 concurrent worker threads sending 200 requests per algorithm:
 
-### Validation & Enforcement Audit
-```
-================================================================================
-                ALGORITHM VALIDATION & ENFORCEMENT AUDIT                
-================================================================================
-Server         | Algorithm                | Allowed | Blocked | Headers | Status
---------------------------------------------------------------------------------
-C++ Server     | Fixed Window Counter     | 10      | 5       | OK      | PASS
-C++ Server     | Sliding Window Log       | 10      | 5       | OK      | PASS
-C++ Server     | Sliding Window Counter   | 10      | 5       | OK      | PASS
-C++ Server     | Token Bucket             | 10      | 5       | OK      | PASS
-C++ Server     | Leaky Bucket             | 10      | 5       | OK      | PASS
-Node Server    | Fixed Window Counter     | 10      | 5       | OK      | PASS
-Node Server    | Sliding Window Log       | 10      | 5       | OK      | PASS
-Node Server    | Sliding Window Counter   | 10      | 5       | OK      | PASS
-Node Server    | Token Bucket             | 10      | 5       | OK      | PASS
-Node Server    | Leaky Bucket             | 10      | 5       | OK      | PASS
-================================================================================
-```
-
-### Concurrent Latency & Throughput Benchmark
 ```
 ==============================================================================================
                      CONCURRENCY LOAD & LATENCY BENCHMARK RESULTS                     
@@ -353,70 +144,27 @@ Node Server  | Token Bucket           | 200    | 1830.9   | 7.76     | 18.12    
 Node Server  | Leaky Bucket           | 200    | 1804.1   | 8.87     | 14.91    | 17.90    | 100/100
 ==============================================================================================
 ```
+* **Median Latency (p50)**: C++ achieved **sub-5ms** (4.96ms on Sliding Window Counter).
+* **Peak Throughput**: C++ sustained **2,213.3 RPS** under heavy concurrency.
+* **Accuracy & Concurrency**: 100% enforcement of quota limits across all test vectors.
 
 ---
 
-## Future Work: Role-Based Rate Limiting (RBAC) Architecture
+## 🛠️ Build Toolchain & System Specifications
 
-In real-world multi-tenant platforms, applying identical static rate limits to all consumers is insufficient. Free users, premium subscribers, enterprise clients, and internal services have distinct SLAs and traffic expectations.
+| Component | Technology | Version / Specification |
+| :--- | :--- | :--- |
+| **C++ Compiler** | MSVC / MinGW-w64 | Visual Studio 2022 (MSVC 19.3x) / GCC 11+ |
+| **C++ Standard** | ISO C++ | C++17 (`-std=c++17` / `/std:c++17`) |
+| **C++ HTTP Server** | `cpp-httplib` | Header-only multi-threaded socket engine |
+| **Node.js Runtime** | Node.js | v18+ / v22 LTS (Express.js + ioredis) |
+| **Distributed Store** | Redis | 6.x / 7.x (Atomic Lua 5.1 scripts) |
+| **Benchmarking Engine** | Python | 3.8+ (`concurrent.futures`, zero dependencies) |
+| **Platform** | OS | Windows x64 / Linux x86_64 |
+| **License** | Open Source | MIT License |
 
-### 1. Conceptual Architecture
+---
 
-```
-Incoming Request
-       │
-       ▼
-[Authentication Layer]
-   Extracts Identity (JWT / API Key / Client ID)
-       │
-       ▼
-[Role & Tier Resolver]
-   Maps Identity to Tier (Anonymous, Free, Pro, Enterprise, Admin)
-       │
-       ▼
-[Dynamic Policy Engine]
-   Retrieves Tier Limits:
-   - Max Requests / Window
-   - Token Capacity & Refill Rate
-   - Priority Queuing Flag
-       │
-       ▼
-[Hierarchical Rate Limiting Engine]
-   Check 1: Global System Safeguard (DDoS mitigation)
-   Check 2: Organization / Tenant Limit (Multi-tenant cap)
-   Check 3: User / Role Limit (Fine-grained quota)
-       │
-    ┌──┴──┐
-    ▼     ▼
- [Pass] [Reject (429 with Tier Diagnostics)]
-```
+## 📄 License
 
-### 2. Tier Hierarchy & Quota Matrix
-
-| Tier | Auth Mechanism | Algorithm Assigned | Burst Capacity | Refill / Rate | Over-Quota Policy |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Anonymous** | Client IP | Fixed Window | 10 reqs | 1 req/min | Strict 429 block |
-| **Free Tier** | JWT (`role: free`) | Sliding Window Counter | 60 reqs | 60 reqs/min | 429 with upgrade link |
-| **Pro Tier** | JWT (`role: pro`) | Token Bucket | 500 tokens | 50 tokens/sec | Soft warning + burst allowance |
-| **Enterprise** | API Key (`tier: ent`)| Token Bucket | 5,000 tokens | 500 tokens/sec | Priority queue buffer, never dropped |
-| **Internal Services**| mTLS / Service JWT| Leaky Bucket | 10,000 reqs | Uncapped leak | Bypasses public limiters |
-
-### 3. Redis Key Namespace Schema
-To support multi-tier isolation without key collisions, Redis keys will follow a structured hierarchical schema:
-```
-rl:rbac:{tenant_id}:{role_tier}:{user_id}:{algorithm}:{window_id}
-```
-Example:
-* `rl:rbac:acme_corp:pro:user_9821:tb`
-* `rl:rbac:global:free:user_102:swcnt:179189520`
-
-### 4. Dynamic Policy Management & Hot Reloading
-Rather than hardcoding limits in code:
-1. **Redis Hash Policy Store:** Store policies in `rl:policies:{role_tier}` (e.g., `HSET rl:policies:pro capacity 500 refill_rate 50`).
-2. **Pub/Sub Hot-Reloading:** When admin changes tier limits, a `PUBLISH rl:policy_update {tier}` message triggers in-memory cache refresh across all running C++ and Node.js nodes without restarting the services.
-
-### 5. Implementation Roadmap
-* **Milestone 1:** Integrate JWT middleware in Node.js and lightweight JWT claims parsing in C++.
-* **Milestone 2:** Implement Redis Hash policy resolution with local LRU caching (TTL 60s) to keep latency under 1ms.
-* **Milestone 3:** Add response headers for tier visibility: `X-RateLimit-Tier: Pro` and `X-RateLimit-Tier-Limit: 500`.
-* **Milestone 4:** Implement enterprise priority queuing using Redis Streams or BullMQ.
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
